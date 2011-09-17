@@ -31,4 +31,5 @@ Gem::Specification.new do |s|
   s.homepage = 'http://www.mongodb.org'
 
   s.add_dependency('bson', Mongo::VERSION)
+  s.add_dependency('bson_ext', Mongo::VERSION)
 end
