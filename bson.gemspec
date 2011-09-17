@@ -23,5 +23,5 @@ Gem::Specification.new do |s|
   s.authors = ['Jim Menard', 'Mike Dirolf', 'Kyle Banker']
   s.email = 'mongodb-dev@googlegroups.com'
   s.homepage = 'http://www.mongodb.org'
-  s.add_dependency('bson_ext', Mongo::VERSION)
+  s.add_dependency('bson_ext',  "1.3.88")
 end
