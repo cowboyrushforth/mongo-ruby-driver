@@ -21,7 +21,7 @@ $:.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
 MINIMUM_BSON_EXT_VERSION = "1.3.89"
 
 module BSON
-  VERSION = "1.3.89"
+  VERSION = "1.4.88"
 
   if defined? Mongo::DEFAULT_MAX_BSON_SIZE
     DEFAULT_MAX_BSON_SIZE = Mongo::DEFAULT_MAX_BSON_SIZE

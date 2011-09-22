@@ -1,3 +1,3 @@
 module Mongo
-  VERSION = "1.3.89"
+  VERSION = "1.4.88"
 end
