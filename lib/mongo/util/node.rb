@@ -1,7 +1,8 @@
 module Mongo
   class Node
 
-    attr_accessor :host, :port, :address, :config, :connection, :socket
+    attr_accessor :host, :port, :address, :config, :connection, :socket,
+      :last_state
 
     def initialize(connection, data)
       @connection = connection
@@ -13,6 +14,7 @@ module Mongo
       end
       @address = "#{host}:#{port}"
       @config = nil
+      @socket = nil
     end
 
     def eql?(other)

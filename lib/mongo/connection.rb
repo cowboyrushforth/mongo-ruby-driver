@@ -30,6 +30,8 @@ module Mongo
     Mutex = ::Mutex
     ConditionVariable = ::ConditionVariable
 
+    Thread.abort_on_exception = true
+
     DEFAULT_PORT = 27017
     STANDARD_HEADER_SIZE = 16
     RESPONSE_HEADER_SIZE = 20
@@ -436,10 +438,8 @@ module Mongo
       packed_message = message.append!(last_error_message).to_s
       begin
         sock = checkout_writer
-        @safe_mutexes[sock].synchronize do
-          send_message_on_socket(packed_message, sock)
-          docs, num_received, cursor_id = receive(sock, last_error_id)
-        end
+        send_message_on_socket(packed_message, sock)
+        docs, num_received, cursor_id = receive(sock, last_error_id)
       ensure
         checkin(sock)
       end
@@ -467,7 +467,8 @@ module Mongo
     # @return [Array]
     #   An array whose indexes include [0] documents returned, [1] number of document received,
     #   and [3] a cursor_id.
-    def receive_message(operation, message, log_message=nil, socket=nil, command=false, read=:primary, exhaust=false)
+    def receive_message(operation, message, log_message=nil, socket=nil, command=false,
+                        read=:primary, exhaust=false)
       request_id = add_message_headers(message, operation)
       packed_message = message.to_s
       begin
@@ -536,7 +537,7 @@ module Mongo
     # NOTE: Do check if this needs to be more stringent.
     # Probably not since if any node raises a connection failure, all nodes will be closed.
     def connected?
-      @primary_pool && @primary_pool.host && @primary_pool.port
+      @primary_pool && !@primary_pool.closed?
     end
 
     # Determine if the connection is active. In a normal case the *server_info* operation
@@ -563,6 +564,13 @@ module Mongo
       @read_primary
     end
     alias :primary? :read_primary?
+
+    # The socket pool that this connection reads from.
+    #
+    # @return [Mongo::Pool]
+    def read_pool
+      @primary_pool
+    end
 
     # The value of the read preference. Because
     # this is a single-node connection, the value
@@ -631,6 +639,9 @@ module Mongo
       # Default maximum BSON object size
       @max_bson_size = Mongo::DEFAULT_MAX_BSON_SIZE
 
+      @safe_mutex_lock = Mutex.new
+      @safe_mutexes = Hash.new {|hash, key| hash[key] = Mutex.new}
+
       # Determine whether to use SSL.
       @ssl = opts.fetch(:ssl, false)
       if @ssl
@@ -665,10 +676,6 @@ module Mongo
 
       # Global safe option. This is false by default.
       @safe = opts[:safe] || false
-
-            # Create a mutex when a new key, in this case a socket,
-      # is added to the hash.
-      @safe_mutexes = Hash.new { |h, k| h[k] = Mutex.new }
 
       # Condition variable for signal and wait
       @queue = ConditionVariable.new

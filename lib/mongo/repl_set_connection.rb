@@ -22,8 +22,8 @@ module Mongo
 
   # Instantiates and manages connections to a MongoDB replica set.
   class ReplSetConnection < Connection
-    attr_reader :nodes, :secondaries, :arbiters, :secondary_pools,
-      :replica_set_name, :read_pool, :seeds, :tags_to_pools,
+    attr_reader :secondaries, :arbiters, :secondary_pools,
+      :replica_set_name, :read_pool, :seeds, :tag_map,
       :refresh_interval, :refresh_mode
 
     # Create a connection to a MongoDB replica set.
@@ -101,9 +101,6 @@ module Mongo
       # TODO: get rid of this
       @nodes = @seeds.dup
 
-      # The members of the replica set, stored as instances of Mongo::Node.
-      @members = []
-
       # Connection pool for primary node
       @primary      = nil
       @primary_pool = nil
@@ -122,6 +119,7 @@ module Mongo
       # Refresh
       @refresh_mode = opts.fetch(:refresh_mode, :sync)
       @refresh_interval = opts[:refresh_interval] || 90
+      @last_refresh = Time.now
 
       if ![:sync, :async, false].include?(@refresh_mode)
         raise MongoArgumentError,
@@ -146,7 +144,7 @@ module Mongo
 
       # Maps
       @sockets_to_pools = {}
-      @tags_to_pools = {}
+      @tag_map = nil
 
       # Replica set name
       if opts[:rs_name]
@@ -164,7 +162,7 @@ module Mongo
     end
 
     def inspect
-      "<Mongo::ReplSetConnection:0x#{self.object_id.to_s(16)} @seeds=#{@seeds} " +
+      "<Mongo::ReplSetConnection:0x#{self.object_id.to_s(16)} @seeds=#{@seeds.inspect} " +
         "@connected=#{@connected}>"
     end
 
@@ -189,37 +187,49 @@ module Mongo
       end
     end
 
-    # Note: this method must be called from within
-    # an exclusive lock.
-    def update_config(manager)
-      @arbiters = manager.arbiters.nil? ? [] : manager.arbiters.dup
-      @primary = manager.primary.nil? ? nil : manager.primary.dup
-      @secondaries = manager.secondaries.dup
-      @hosts = manager.hosts.dup
+    # Determine whether a replica set refresh is
+    # required. If so, run a hard refresh. You can
+    # force a hard refresh by running
+    # ReplSetConnection#hard_refresh!
+    #
+    # @return [Boolean] +true+ unless a hard refresh
+    #   is run and the refresh lock can't be acquired.
+    def refresh(opts={})
+      if !connected?
+        log(:info, "Trying to check replica set health but not " +
+          "connected...")
+        return hard_refresh!
+      end
 
-      @primary_pool = manager.primary_pool
-      @read_pool    = manager.read_pool
-      @secondary_pools = manager.secondary_pools
-      @tags_to_pools   = manager.tags_to_pools
-      @seeds = manager.seeds
-      @manager = manager
-      @nodes = manager.nodes
-      @max_bson_size = manager.max_bson_size
+      log(:info, "Checking replica set connection health...")
+      @manager.check_connection_health
+
+      if @manager.refresh_required?
+        return hard_refresh!
+      end
+
+      return true
     end
 
-    # Refresh the current replica set configuration.
-    def refresh(opts={})
-      return false if !connected?
+    # Force a hard refresh of this connection's view
+    # of the replica set.
+    #
+    # @return [Boolean] +true+ if hard refresh
+    #   occurred. +false+ is returned when unable
+    #   to get the refresh lock.
+    def hard_refresh!
+      return false if sync_exclusive?
 
-      # Return if another thread is already in the process of refreshing.
-      return if sync_exclusive?
+      log(:info, "Initiating hard refresh...")
+      @background_manager = PoolManager.new(self, @seeds)
+      @background_manager.connect
 
       sync_synchronize(:EX) do
-        log(:info, "Refreshing...")
-        @background_manager ||= PoolManager.new(self, @seeds)
-        @background_manager.connect
+        @manager.close
         update_config(@background_manager)
       end
+
+      initiate_refresh_mode
 
       return true
     end
@@ -280,13 +290,6 @@ module Mongo
           @refresh_thread = nil
         end
 
-        if @nodes
-          @nodes.each do |member|
-            member.close
-          end
-        end
-
-        @nodes = []
         @read_pool = nil
 
         if @secondary_pools
@@ -295,10 +298,10 @@ module Mongo
           end
         end
 
-        @secondaries     = []
-        @secondary_pools = []
-        @arbiters        = []
-        @tags_to_pools.clear
+        @secondaries      = []
+        @secondary_pools  = []
+        @arbiters         = []
+        @tag_map = nil
         @sockets_to_pools.clear
       end
     end
@@ -337,22 +340,6 @@ module Mongo
       end
     end
 
-    private
-
-    def initiate_refresh_mode
-      if @refresh_mode == :async
-        return if @refresh_thread && @refresh_thread.alive?
-        @refresh_thread = Thread.new do
-          while true do
-            sleep(@refresh_interval)
-            refresh
-          end
-        end
-      end
-
-      @last_refresh = Time.now
-    end
-
     # Checkout a socket for reading (i.e., a secondary node).
     # Note that @read_pool might point to the primary pool
     # if no read pool has been defined.
@@ -372,27 +359,6 @@ module Mongo
       end
     end
 
-    # Checkout a socket connected to a node with one of
-    # the provided tags. If no such node exists, raise
-    # an exception.
-    #
-    # NOTE: will be available in driver release v2.0.
-    def checkout_tagged(tags)
-      sync_synchronize(:SH) do
-        tags.each do |k, v|
-          pool = @tags_to_pools[{k.to_s => v}]
-          if pool
-            socket = pool.checkout
-            @sockets_to_pools[socket] = pool
-            return socket
-          end
-        end
-      end
-
-      raise NodeWithTagsNotFound,
-        "Could not find a connection tagged with #{tags}."
-    end
-
     # Checkout a socket for writing (i.e., a primary node).
     def checkout_writer
       connect unless connected?
@@ -407,6 +373,28 @@ module Mongo
         socket
       else
         raise ConnectionFailure.new("Could not connect to primary node.")
+      end
+    end
+
+    def checkin(socket)
+      sync_synchronize(:SH) do
+        if pool = @sockets_to_pools[socket]
+          pool.checkin(socket)
+        elsif socket
+          begin
+            socket.close
+          rescue IOError
+            log(:info, "Tried to close socket #{socket} but already closed.")
+          end
+        end
+      end
+
+      # Refresh synchronously every @refresh_interval seconds
+      # if synchronous refresh mode is enabled.
+      if @refresh_mode == :sync &&
+        ((Time.now - @last_refresh) > @refresh_interval)
+        refresh
+        @last_refresh = Time.now
       end
     end
 
@@ -426,6 +414,65 @@ module Mongo
       end
     end
 
+    private
+
+    # Given a pool manager, update this connection's
+    # view of the replica set.
+    #
+    # This method must be called within
+    # an exclusive lock.
+    def update_config(manager)
+      @arbiters = manager.arbiters.nil? ? [] : manager.arbiters.dup
+      @primary = manager.primary.nil? ? nil : manager.primary.dup
+      @secondaries = manager.secondaries.dup
+      @hosts = manager.hosts.dup
+
+      @primary_pool = manager.primary_pool
+      @read_pool    = manager.read_pool
+      @secondary_pools = manager.secondary_pools
+      @tag_map = manager.tag_map
+      @seeds = manager.seeds
+      @manager = manager
+      @nodes = manager.nodes
+      @max_bson_size = manager.max_bson_size
+      @sockets_to_pools.clear
+    end
+
+    def initiate_refresh_mode
+      if @refresh_mode == :async
+        return if @refresh_thread && @refresh_thread.alive?
+        @refresh_thread = Thread.new do
+          while true do
+            sleep(@refresh_interval)
+            refresh
+          end
+        end
+      end
+
+      @last_refresh = Time.now
+    end
+
+    # Checkout a socket connected to a node with one of
+    # the provided tags. If no such node exists, raise
+    # an exception.
+    #
+    # NOTE: will be available in driver release v2.0.
+    def checkout_tagged(tags)
+      sync_synchronize(:SH) do
+        tags.each do |k, v|
+          pool = @tag_map[{k.to_s => v}]
+          if pool
+            socket = pool.checkout
+            @sockets_to_pools[socket] = pool
+            return socket
+          end
+        end
+      end
+
+      raise NodeWithTagsNotFound,
+        "Could not find a connection tagged with #{tags}."
+    end
+
     # Checkin a socket used for reading.
     def checkin_reader(socket)
       warn "ReplSetConnection#checkin_writer is deprecated and will be removed " +
@@ -438,23 +485,6 @@ module Mongo
       warn "ReplSetConnection#checkin_writer is deprecated and will be removed " +
         "in driver v2.0. Use ReplSetConnection#checkin instead."
       checkin(socket)
-    end
-
-    def checkin(socket)
-      sync_synchronize(:SH) do
-        if pool = @sockets_to_pools[socket]
-          pool.checkin(socket)
-        elsif socket
-          socket.close
-        end
-      end
-
-      # Refresh synchronously every @refresh_interval seconds
-      # if synchronous refresh mode is enabled.
-      if @refresh_mode == :sync &&
-        ((Time.now - @last_refresh) > @refresh_interval)
-        refresh
-      end
     end
   end
 end
