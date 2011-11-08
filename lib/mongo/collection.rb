@@ -87,6 +87,7 @@ module Mongo
       @db, @name  = db, name
       @connection = @db.connection
       @cache_time = @db.cache_time
+      @logger     = @connection.logger
       @cache = Hash.new(0)
       unless pk_factory
         @safe = opts.fetch(:safe, @db.safe)
