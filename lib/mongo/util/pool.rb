@@ -17,11 +17,13 @@
 
 module Mongo
   class Pool
-    PING_ATTEMPTS = 6
-    MAX_PING_TIME = 1_000_000
+    PRUNE_INTERVAL = 300
+    PING_ATTEMPTS  = 6
+    MAX_PING_TIME  = 1_000_000
 
     attr_accessor :host, :port, :address,
-      :size, :timeout, :safe, :checked_out, :connection
+      :size, :timeout, :safe, :checked_out, :connection,
+      :sockets_low
 
     # Create a new pool of connections.
     def initialize(connection, host, port, opts={})
@@ -36,7 +38,7 @@ module Mongo
       @address = "#{@host}:#{@port}"
 
       # Pool size and timeout.
-      @size      = opts[:size] || 10
+      @size      = opts[:size] || 10000
       @timeout   = opts[:timeout]   || 5.0
 
       # Mutex for synchronizing pool access
@@ -48,17 +50,29 @@ module Mongo
       # Operations to perform on a socket
       @socket_ops = Hash.new { |h, k| h[k] = [] }
 
+      @sockets_low  = true
       @sockets      = []
       @pids         = {}
       @checked_out  = []
+      @threads      = {}
       @ping_time    = nil
       @last_ping    = nil
       @closed       = false
+      @last_pruning = Time.now
     end
 
-    def close
+    # Close this pool.
+    #
+    # @option opts [Boolean] :soft (false) If true,
+    #   close only those sockets that are not checked out.
+    def close(opts={})
       @connection_mutex.synchronize do
-        (@sockets - @checked_out).each do |sock|
+        if opts[:soft]
+          sockets_to_close = @sockets - @checked_out
+        else
+          sockets_to_close = @sockets
+        end
+        sockets_to_close.each do |sock|
           begin
             sock.close
           rescue IOError => ex
@@ -74,6 +88,10 @@ module Mongo
 
     def closed?
       @closed
+    end
+
+    def sockets_low?
+      @sockets_low
     end
 
     def inspect
@@ -165,6 +183,7 @@ module Mongo
       @sockets << socket
       @pids[socket] = Process.pid
       @checked_out << socket
+      @threads[socket] = Thread.current.object_id
       socket
     end
 
@@ -210,7 +229,23 @@ module Mongo
          checkout_new_socket
       else
         @checked_out << socket
+        @threads[socket] = Thread.current.object_id
         socket
+      end
+    end
+
+    # If we have more sockets than the soft limit specified
+    # by the max pool size, then we should prune those
+    # extraneous sockets.
+    #
+    # Note: this must be called from within a mutex.
+    def prune
+      surplus = @size - @sockets.size
+      return if surplus <= 0
+      idle_sockets = @sockets - @checked_out
+      [surplus, idle_sockets.length].min.times do |n|
+        idle_sockets[n].close
+        @sockets.delete(idle_sockets[n])
       end
     end
 
@@ -228,20 +263,30 @@ module Mongo
         end
 
         @connection_mutex.synchronize do
+          if @sockets.size > 0.7 * @size
+            @sockets_low = true
+          else
+            @sockets_low = false
+          end
+
+          if (Time.now - @last_pruning) > PRUNE_INTERVAL
+            prune
+            @last_pruning = Time.now
+          end
+
           socket = if @checked_out.size < @sockets.size
                      checkout_existing_socket
-                   elsif @sockets.size < @size
+                   else
                      checkout_new_socket
                    end
 
           if socket
-
-          # This calls all procs, in order, scoped to existing sockets.
-          # At the moment, we use this to lazily authenticate and
-          # logout existing socket connections.
-          @socket_ops[socket].reject! do |op|
-            op.call
-          end
+            # This calls all procs, in order, scoped to existing sockets.
+            # At the moment, we use this to lazily authenticate and
+            # logout existing socket connections.
+            @socket_ops[socket].reject! do |op|
+              op.call
+            end
 
             return socket
           else

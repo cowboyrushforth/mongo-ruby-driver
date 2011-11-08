@@ -20,13 +20,14 @@ class ReplSetManager
     @retries    = opts[:retries] || 30
     @config     = {"_id" => @name, "members" => []}
     @durable    = opts.fetch(:durable, false)
+    @smallfiles = opts.fetch(:smallfiles, true)
     @path       = File.join(File.expand_path(File.dirname(__FILE__)), "data")
-    @oplog_size = opts.fetch(:oplog_size, 32)
+    @oplog_size = opts.fetch(:oplog_size, 16)
     @tags = [{"dc" => "ny", "rack" => "a", "db" => "main"},
              {"dc" => "ny", "rack" => "b", "db" => "main"},
              {"dc" => "sf", "rack" => "a", "db" => "main"}]
 
-    @arbiter_count   = opts[:arbiter_count]   || 2
+    @arbiter_count   = opts[:arbiter_count]   || 0
     @secondary_count = opts[:secondary_count] || 2
     @passive_count   = opts[:passive_count] || 0
     @primary_count   = 1
@@ -43,20 +44,10 @@ class ReplSetManager
   end
 
   def start_set
-    begin
-    con = Mongo::Connection.new(@host, @start_port)
-      rescue Mongo::ConnectionFailure
-      con = false
-    end
-
-    if con && ensure_up(1, con)
-      should_start = false
-      puts "** Replica set already started."
-    else
-      should_start = true
-      system("killall mongod")
-      puts "** Starting a replica set with #{@count} nodes"
-    end
+    system("killall mongod")
+    sleep(1)
+    should_start = true
+    puts "** Starting a replica set with #{@count} nodes"
 
     n = 0
     (@primary_count + @secondary_count).times do
@@ -82,15 +73,8 @@ class ReplSetManager
       n += 1
     end
 
-    if con && ensure_up(1, con)
-      @mongods.each do |k, v|
-        v['up'] = true
-        v['pid'] = File.open(File.join(v['db_path'], 'mongod.lock')).read.strip
-      end
-    else
-      initiate
-      ensure_up
-    end
+    initiate
+    ensure_up
   end
 
   def cleanup_set
@@ -143,6 +127,7 @@ class ReplSetManager
     @mongods[n]['start'] = "mongod --replSet #{@name} --logpath '#{@mongods[n]['log_path']}' " +
      "--oplogSize #{@oplog_size} #{journal_switch} --dbpath #{@mongods[n]['db_path']} --port #{@mongods[n]['port']} --fork"
     @mongods[n]['start'] += " --dur" if @durable
+    @mongods[n]['start'] += " --smallfiles" if @smallfiles
     @mongods[n]['start']
   end
 
@@ -254,21 +239,49 @@ class ReplSetManager
     print "** Ensuring members are up..."
 
     attempt(n) do
-      con = connection || get_connection
-      status = con['admin'].command({'replSetGetStatus' => 1})
       print "."
-      if status['members'].all? { |m| m['health'] == 1 &&
-         [1, 2, 7].include?(m['state']) } &&
-         status['members'].any? { |m| m['state'] == 1 }
-        print "all members up!\n\n"
+      con = connection || get_connection
+      begin
+        status = con['admin'].command({:replSetGetStatus => 1})
+      rescue Mongo::OperationFailure => ex
         con.close
-        return status
-      else
-        con.close
-        raise Mongo::OperationFailure
+        raise ex
       end
-    end
+      if status['members'].all? { |m| m['health'] == 1 &&
+        [1, 2, 7].include?(m['state']) } &&
+        status['members'].any? { |m| m['state'] == 1 }
 
+       connections = []
+       states      = []
+       status['members'].each do |member|
+         begin
+           host, port = member['name'].split(':')
+           port = port.to_i
+           conn = Mongo::Connection.new(host, port, :slave_ok => true)
+           connections << conn
+           state = conn['admin'].command({:ismaster => 1})
+           states << state
+         rescue Mongo::ConnectionFailure
+           connections.each {|c| c.close }
+           con.close
+           raise Mongo::OperationFailure
+         end
+       end
+
+       if states.any? {|s| s['ismaster']}
+         print "all members up!\n\n"
+         connections.each {|c| c.close }
+         con.close
+         return status
+       else
+         con.close
+         raise Mongo::OperationFailure
+       end
+     else
+       con.close
+       raise Mongo::OperationFailure
+     end
+    end
     return false
   end
 
@@ -302,7 +315,8 @@ class ReplSetManager
     con = get_connection
 
     attempt do
-      p con['admin'].command({'replSetInitiate' => @config})
+      con.object_id
+      con['admin'].command({'replSetInitiate' => @config})
     end
 
     con.close

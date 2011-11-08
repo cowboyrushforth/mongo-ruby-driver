@@ -79,15 +79,15 @@ module Mongo
       @refresh_required
     end
 
-    def close
+    def close(opts={})
       begin
         if @primary_pool
-          @primary_pool.close
+          @primary_pool.close(opts)
         end
 
         if @secondary_pools
           @secondary_pools.each do |pool|
-            pool.close
+            pool.close(opts)
           end
         end
 
@@ -188,7 +188,7 @@ module Mongo
       @primary = member.host_port
       @primary_pool = Pool.new(self.connection, member.host, member.port,
                               :size => self.connection.pool_size,
-                              :timeout => self.connection.connect_timeout,
+                              :timeout => self.connection.pool_timeout,
                               :node => member)
       associate_tags_with_pool(member.tags, @primary_pool)
     end
@@ -198,7 +198,7 @@ module Mongo
       @secondaries << member.host_port
       pool = Pool.new(self.connection, member.host, member.port,
                                    :size => self.connection.pool_size,
-                                   :timeout => self.connection.connect_timeout,
+                                   :timeout => self.connection.pool_timeout,
                                    :node => member)
       @secondary_pools << pool
       associate_tags_with_pool(member.tags, pool)
@@ -257,7 +257,9 @@ module Mongo
     def get_valid_seed_node
       @seeds.each do |seed|
         node = Mongo::Node.new(self.connection, seed)
-        if node.connect && node.set_config
+        if !node.connect
+          next
+        elsif node.set_config
           return node
         else
           node.close
