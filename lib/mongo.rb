@@ -16,14 +16,13 @@
 # limitations under the License.
 # ++
 
-$:.unshift(File.join(File.dirname(__FILE__), '..', 'lib'))
-
 require 'mongo/version'
 
 module Mongo
-  ASCENDING  =  1
-  DESCENDING = -1
-  GEO2D      = '2d'
+  ASCENDING   =  1
+  DESCENDING  = -1
+  GEO2D       = '2d'
+  GEOHAYSTACK = 'geoHaystack'
 
   DEFAULT_MAX_BSON_SIZE = 4 * 1024 * 1024
 
