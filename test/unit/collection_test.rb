@@ -5,7 +5,7 @@ class CollectionTest < Test::Unit::TestCase
   context "Basic operations: " do
     setup do
       @logger = mock()
-      @logger.expects(:debug)
+      @logger.expects(:warn)
     end
 
     should "send update message" do
@@ -124,6 +124,16 @@ class CollectionTest < Test::Unit::TestCase
       end
 
       @coll.ensure_index [["x", Mongo::DESCENDING], ["y", Mongo::DESCENDING]]
+    end
+
+    should "use the connection's logger" do
+      @conn = Connection.new('localhost', 27017, :logger => @logger, :connect => false)
+      @db   = @conn['testing']
+      @coll = @db.collection('books')
+      @logger.expects(:warn).with do |msg|
+        msg == "MONGODB [WARNING] test warning"
+      end
+      @coll.log(:warn, "test warning")
     end
   end
 end

@@ -278,6 +278,42 @@ class TestConnection < Test::Unit::TestCase
     end
   end
 
+  context "Socket pools" do
+    context "checking out writers" do
+      setup do
+        @con = standard_connection(:pool_size => 10, :timeout => 10)
+        @coll = @con[MONGO_TEST_DB]['test-connection-exceptions']
+      end
+
+      should "close the connection on send_message for major exceptions" do
+        @con.expects(:checkout_writer).raises(SystemStackError)
+        @con.expects(:close)
+        begin
+          @coll.insert({:foo => "bar"})
+        rescue SystemStackError
+        end
+      end
+
+      should "close the connection on send_message_with_safe_check for major exceptions" do
+        @con.expects(:checkout_writer).raises(SystemStackError)
+        @con.expects(:close)
+        begin
+          @coll.insert({:foo => "bar"}, :safe => true)
+        rescue SystemStackError
+        end
+      end
+
+      should "close the connection on receive_message for major exceptions" do
+        @con.expects(:checkout_writer).raises(SystemStackError)
+        @con.expects(:close)
+        begin
+          @coll.find.next
+        rescue SystemStackError
+        end
+      end
+    end
+  end
+
   context "Connection exceptions" do
     setup do
       @con = standard_connection(:pool_size => 10, :timeout => 10)

@@ -206,6 +206,14 @@ class TestCollection < Test::Unit::TestCase
     end
   end
 
+  if @@version >= "2.0.0"
+    def test_safe_mode_with_journal_commit_option
+      @@test.insert({:foo => 1}, :safe => {:j => true})
+      @@test.update({:foo => 1}, {:foo => 2}, :safe => {:j => true})
+      @@test.remove({:foo => 2}, :safe => {:j => true})
+    end
+  end
+
   def test_update
     id1 = @@test.save("x" => 5)
     @@test.update({}, {"$inc" => {"x" => 1}})
@@ -661,13 +669,13 @@ class TestCollection < Test::Unit::TestCase
 
     @@test.ensure_index([["x", Mongo::DESCENDING]], {})
     assert_equal 2, @@test.index_information.keys.count
-    assert @@test.index_information.keys.include? "x_-1"
+    assert @@test.index_information.keys.include?("x_-1")
 
     @@test.ensure_index([["x", Mongo::ASCENDING]])
-    assert @@test.index_information.keys.include? "x_1"
+    assert @@test.index_information.keys.include?("x_1")
 
     @@test.ensure_index([["type", 1], ["date", -1]])
-    assert @@test.index_information.keys.include? "type_1_date_-1"
+    assert @@test.index_information.keys.include?("type_1_date_-1")
 
     @@test.drop_index("x_1")
     assert_equal 3, @@test.index_information.keys.count
@@ -676,7 +684,7 @@ class TestCollection < Test::Unit::TestCase
 
     @@test.ensure_index([["x", Mongo::DESCENDING]], {})
     assert_equal 3, @@test.index_information.keys.count
-    assert @@test.index_information.keys.include? "x_-1"
+    assert @@test.index_information.keys.include?("x_-1")
 
     # Make sure that drop_index expires cache properly
     @@test.ensure_index([['a', 1]])
@@ -703,6 +711,26 @@ class TestCollection < Test::Unit::TestCase
     sleep(3)
     # This won't be, so generate_indexes will be called twice
     coll.ensure_index([['a', 1]])
+  end
+
+
+  if @@version > '2.0.0'
+    def test_show_disk_loc
+      @@test.save({:a => 1})
+      @@test.save({:a => 2})
+      assert @@test.find({:a => 1}, :show_disk_loc => true).show_disk_loc
+      assert @@test.find({:a => 1}, :show_disk_loc => true).next['$diskLoc']
+      @@test.remove
+    end
+
+    def test_max_scan
+      1000.times do |n|
+        @@test.save({:a => n})
+      end
+      assert @@test.find({:a => 999}).next
+      assert !@@test.find({:a => 999}, :max_scan => 500).next
+      @@test.remove
+    end
   end
 
   context "Grouping" do

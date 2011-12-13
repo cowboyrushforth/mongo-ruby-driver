@@ -26,7 +26,7 @@ module Mongo
     attr_reader :collection, :selector, :fields,
       :order, :hint, :snapshot, :timeout,
       :full_collection_name, :transformer,
-      :options, :cursor_id
+      :options, :cursor_id, :show_disk_loc
 
     # Create a new cursor.
     #
@@ -86,7 +86,7 @@ module Mongo
       if(!@timeout)
         add_option(OP_QUERY_NO_CURSOR_TIMEOUT)
       end
-      if(@connection.slave_ok?)
+      if(@read_preference != :primary)
         add_option(OP_QUERY_SLAVE_OK)
       end
       if(@tailable)
@@ -136,7 +136,7 @@ module Mongo
         # If the server has stopped being the master (e.g., it's one of a
         # pair but it has died or something like that) then we close that
         # connection. The next request will re-open on master server.
-        if err == "not master"
+        if err.include?("not master")
           @connection.close
           raise ConnectionFailure.new(err, doc['code'], doc)
         end
@@ -518,13 +518,21 @@ module Mongo
     end
 
     def checkout_socket_from_connection
-      @checkin_connection = true
-      if @command || @read_preference == :primary
-        @connection.get_local_writer
-      else
-        @read_pool = @connection.read_pool
-        @connection.get_local_reader
+      socket = nil
+      begin
+        @checkin_connection = true
+        if @command || @read_preference == :primary
+          socket = @connection.checkout_writer
+        else
+          @read_pool = @connection.read_pool
+          socket = @connection.checkout_reader
+        end
+      rescue SystemStackError, NoMemoryError, SystemCallError => ex
+        @connection.close
+        raise ex
       end
+
+      socket
     end
 
     def checkout_socket_for_op_get_more
@@ -540,9 +548,15 @@ module Mongo
         pool.host == @read_pool.host && pool.port == @read_pool.port
       end
       if new_pool
-        @read_pool = new_pool
-        sock = new_pool.checkout
-        @checkin_read_pool = true
+        sock = nil
+        begin
+          @read_pool = new_pool
+          sock = new_pool.checkout
+          @checkin_read_pool = true
+        rescue SystemStackError, NoMemoryError, SystemCallError => ex
+          @connection.close
+          raise ex
+        end
         return sock
       else
         raise Mongo::OperationFailure, "Failure to continue iterating " +
@@ -556,7 +570,11 @@ module Mongo
         @read_pool.checkin(sock)
         @checkin_read_pool = false
       elsif @checkin_connection
-        @connection.local_socket_done(sock)
+        if @command || @read_preference == :primary
+          @connection.checkin_writer(sock)
+        else
+          @connection.checkin_reader(sock)
+        end
         @checkin_connection = false
       end
     end
@@ -566,7 +584,11 @@ module Mongo
         @read_pool.checkin(sock)
         @checkin_read_pool = false
       else
-        @connection.checkin(sock)
+        if @command || @read_preference == :primary
+          @connection.checkin_writer(sock)
+        else
+          @connection.checkin_reader(sock)
+        end
         @checkin_connection = false
       end
     end
@@ -600,7 +622,7 @@ module Mongo
       spec['$hint']     = @hint if @hint && @hint.length > 0
       spec['$explain']  = true if @explain
       spec['$snapshot'] = true if @snapshot
-      spec['$maxscan']  = @max_scan if @max_scan
+      spec['$maxScan']  = @max_scan if @max_scan
       spec['$returnKey']   = true if @return_key
       spec['$showDiskLoc'] = true if @show_disk_loc
       spec
@@ -608,7 +630,8 @@ module Mongo
 
     # Returns true if the query contains order, explain, hint, or snapshot.
     def query_contains_special_fields?
-      @order || @explain || @hint || @snapshot
+      @order || @explain || @hint || @snapshot || @show_disk_loc ||
+        @max_scan || @return_key
     end
 
     def close_cursor_if_query_complete

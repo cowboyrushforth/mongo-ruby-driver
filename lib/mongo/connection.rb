@@ -458,12 +458,13 @@ module Mongo
       @primary_pool
     end
 
-    # The value of the read preference. Because
-    # this is a single-node connection, the value
-    # is +:primary+, and the connection will read
-    # from whichever type of node it's connected to.
+    # The value of the read preference.
     def read_preference
-      :primary
+      if slave_ok?
+        :secondary
+      else
+        :primary
+      end
     end
 
     # Close the connection to the database.
@@ -479,44 +480,6 @@ module Mongo
     # @return [Integer]
     def max_bson_size
       @max_bson_size
-    end
-
-    def get_local_reader
-     self.connections ||= {}
-     if !connected? && self.connections[self.object_id]
-       self.connections[self.object_id]
-     else
-       self.connections[self.object_id] = {}
-     end
-     self.connections[self.object_id][:reader] ||= checkout_reader
-    end
-
-    def get_local_writer
-     self.connections ||= {}
-     if !connected? && self.connections[self.object_id]
-       self.connections[self.object_id]
-     else
-       self.connections[self.object_id] = {}
-     end
-     self.connections[self.object_id][:writer] ||= checkout_writer
-    end
-
-    # Used to close, check in, or refresh sockets held
-    # in thread-local variables.
-    def local_socket_done(socket)
-       if self.connections[self.object_id][:reader] == socket
-         if self.read_pool.sockets_low?
-           checkin(socket)
-           self.connections[self.object_id][:reader] = nil
-         end
-       end
-
-       if self.connections[self.object_id][:writer] == socket
-         if self.primary_pool && self.primary_pool.sockets_low?
-           checkin(socket)
-           self.connections[self.object_id][:writer] = nil
-         end
-       end
     end
 
     # Checkout a socket for reading (i.e., a secondary node).
@@ -536,16 +499,12 @@ module Mongo
     # Checkin a socket used for reading.
     # Note: this is overridden in ReplSetConnection.
     def checkin_reader(socket)
-      warn "Connection#checkin_writer is not deprecated and will be removed " +
-        "in driver v2.0. Use Connection#checkin instead."
       checkin(socket)
     end
 
     # Checkin a socket used for writing.
     # Note: this is overridden in ReplSetConnection.
     def checkin_writer(socket)
-      warn "Connection#checkin_writer is not deprecated and will be removed " +
-        "in driver v2.0. Use Connection#checkin instead."
       checkin(socket)
     end
 
@@ -608,8 +567,7 @@ module Mongo
       @logger = opts[:logger] || nil
 
       if @logger
-        @logger.debug("MongoDB logging. Please note that logging negatively impacts performance " +
-        "and should be disabled for high-performance production apps.")
+        write_logging_startup_message
       end
 
       should_connect = opts.fetch(:connect, true)

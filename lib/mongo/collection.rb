@@ -86,6 +86,7 @@ module Mongo
 
       @db, @name  = db, name
       @connection = @db.connection
+      @logger     = @connection.logger
       @cache_time = @db.cache_time
       @logger     = @connection.logger
       @cache = Hash.new(0)
@@ -218,7 +219,7 @@ module Mongo
       max_scan   = opts.delete(:max_scan)
       return_key = opts.delete(:return_key)
       transformer = opts.delete(:transformer)
-      show_disk_loc = opts.delete(:max_scan)
+      show_disk_loc = opts.delete(:show_disk_loc)
       read          = opts.delete(:read) || @read_preference
 
       if timeout == false && !block_given?

@@ -155,8 +155,8 @@ class ReplSetManager
   def add_node(n=nil)
     primary = get_node_with_state(1)
     con = get_connection(primary)
-    init_node(n || @mongods.length)
 
+    init_node(n || @mongods.length)
     config = con['local']['system.replset'].find_one
     @config['version'] = config['version'] + 1
 
@@ -248,8 +248,8 @@ class ReplSetManager
         raise ex
       end
       if status['members'].all? { |m| m['health'] == 1 &&
-        [1, 2, 7].include?(m['state']) } &&
-        status['members'].any? { |m| m['state'] == 1 }
+       [1, 2, 7].include?(m['state']) } &&
+       status['members'].any? { |m| m['state'] == 1 }
 
        connections = []
        states      = []
@@ -281,7 +281,7 @@ class ReplSetManager
        con.close
        raise Mongo::OperationFailure
      end
-    end
+     end
     return false
   end
 

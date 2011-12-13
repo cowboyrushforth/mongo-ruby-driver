@@ -4,7 +4,8 @@ class TestThreading < Test::Unit::TestCase
 
   include Mongo
 
-  @@db = standard_connection(:pool_size => 10, :timeout => 30).db(MONGO_TEST_DB)
+  @@con = standard_connection(:pool_size => 10, :timeout => 30)
+  @@db  = @@con[MONGO_TEST_DB]
   @@coll = @@db.collection('thread-test-collection')
 
   def set_up_safe_data

@@ -51,16 +51,14 @@ module Mongo
     # @option options [Float] :pool_timeout (5.0) When all of the connections a pool are checked out,
     #   this is the number of seconds to wait for a new connection to be released before throwing an exception.
     #   Note: this setting is relevant only for multi-threaded applications.
-    # @option opts [Float] :op_timeout (nil) The number of seconds to wait for a read operation to time out.
-    #   Disabled by default.
+    # @option opts [Float] :op_timeout (30) The number of seconds to wait for a read operation to time out.
     # @option opts [Float] :connect_timeout (nil) The number of seconds to wait before timing out a
     #   connection attempt.
     # @option opts [Boolean] :ssl (false) If true, create the connection to the server using SSL.
-    # @option opts [Boolean] :refresh_mode (false) Set this to :async to enable a background thread that
-    #   periodically updates the state of the connection. If, for example, you initially connect while a secondary
-    #   is down, this will reconnect to that secondary behind the scenes to
-    #   prevent you from having to reconnect manually. If set to :sync, refresh will happen
-    #   synchronously. If +false+, no automatic refresh will occur unless there's a connection failure.
+    # @option opts [Boolean] :refresh_mode (false) Set this to :sync to periodically update the
+    #   state of the connection every :refresh_interval seconds. Replica set connection failures
+    #   will always trigger a complete refresh. This option is useful when you want to add new nodes
+    #   or remove replica set nodes not currently in use by the driver.
     # @option opts [Integer] :refresh_interval (90) If :refresh_mode is enabled, this is the number of seconds
     #   between calls to check the replica set's state.
     # @option opts [Boolean] :require_primary (true) If true, require a primary node for the connection
@@ -92,8 +90,10 @@ module Mongo
         raise MongoArgumentError, "A ReplSetConnection requires at least one seed node."
       end
 
-      # The list of seed nodes
+      # The original, immutable list of seed node.
+      # TODO: add a method for replacing this list of node.
       @seeds = args
+      @seeds.freeze
 
       # TODO: get rid of this
       @nodes = @seeds.dup
@@ -105,10 +105,14 @@ module Mongo
 
       # No connection manager by default.
       @manager = nil
+      @pool_mutex = Mutex.new
 
-      if ![:sync, :async, false].include?(@refresh_mode)
+      if @refresh_mode == :async
+        warn ":async refresh mode has been deprecated. Refresh
+        mode will be disabled."
+      elsif ![:sync, false].include?(@refresh_mode)
         raise MongoArgumentError,
-          "Refresh mode must be one of :sync, :async, or false."
+          "Refresh mode must be either :sync or false."
       end
 
       # Are we allowing reads from secondaries?
@@ -123,15 +127,7 @@ module Mongo
       end
 
       @connected = false
-
-      # Store the refresher thread
-      @refresh_thread  = nil
       @refresh_version = 0
-
-      # Maps
-      @sockets_to_pools = {}
-      @threads_to_sockets = Hash.new { |h, k| h[k] = Hash.new }
-      @tag_map = nil
 
       # Replica set name
       if opts[:rs_name]
@@ -157,11 +153,12 @@ module Mongo
     def connect
       log(:info, "Connecting...")
       return if @connected
-      manager = PoolManager.new(self, @seeds)
-      manager.connect
 
-      update_config(manager)
-      initiate_refresh_mode
+      discovered_seeds = @manager ? @manager.seeds : []
+      @manager = PoolManager.new(self, discovered_seeds)
+
+      @manager.connect
+      @refresh_version += 1
 
       if @require_primary && self.primary.nil? #TODO: in v2.0, we'll let this be optional and do a lazy connect.
         close
@@ -188,7 +185,7 @@ module Mongo
         return hard_refresh!
       end
 
-      log(:info, "Checking replica set connection health...")
+      log(:debug, "Checking replica set connection health...")
       @manager.check_connection_health
 
       if @manager.refresh_required?
@@ -206,20 +203,21 @@ module Mongo
     #   to get the refresh lock.
     def hard_refresh!
       log(:info, "Initiating hard refresh...")
-      background_manager = PoolManager.new(self, @seeds)
+      discovered_seeds = @manager ? @manager.seeds : []
+      background_manager = PoolManager.new(self, discovered_seeds | @seeds)
       background_manager.connect
 
       # TODO: make sure that connect has succeeded
       old_manager = @manager
-      update_config(background_manager)
+      @manager = background_manager
       old_manager.close(:soft => true)
-      initiate_refresh_mode
+      @refresh_version += 1
 
       return true
     end
 
     def connected?
-      self.primary_pool || self.read_pool
+      @connected && (self.primary_pool || self.read_pool)
     end
 
     # @deprecated
@@ -262,16 +260,13 @@ module Mongo
     end
 
     # Close the connection to the database.
-    def close
-      @connected = false
-
-      if @refresh_thread
-        @refresh_thread = nil
+    def close(opts={})
+      if opts[:soft]
+        @manager.close(:soft => true) if @manager
+      else
+        @manager.close if @manager
       end
-
-      @manager.close if @manager
-      @sockets_to_pools.clear
-      @threads_to_sockets.clear
+      @connected = false
     end
 
     # If a ConnectionFailure is raised, this method will be called
@@ -308,81 +303,26 @@ module Mongo
       end
     end
 
-    def get_local_reader
-     self.connections ||= {}
-     if !connected? && self.connections[self.object_id]
-       self.connections[self.object_id]
-     else
-       self.connections[self.object_id] = {}
-     end
-     socket = self.connections[self.object_id][:reader] ||= checkout_reader
-     if self.read_pool != @sockets_to_pools[socket]
-       checkin(socket)
-       socket = self.connections[self.object_id][:reader] = checkout_reader
-     end
-
-     @threads_to_sockets[Thread.current][:reader] = socket
-    end
-
-    def get_local_writer
-     self.connections ||= {}
-     if !connected? && self.connections[self.object_id]
-       self.connections[self.object_id]
-     else
-       self.connections[self.object_id] = {}
-     end
-     socket = self.connections[self.object_id][:writer] ||= checkout_writer
-     if self.primary_pool != @sockets_to_pools[socket]
-       checkin(socket)
-       socket = self.connections[self.object_id][:writer] = checkout_writer
-     end
-     @threads_to_sockets[Thread.current][:writer] = socket
-    end
-
-    # Used to close, check in, or refresh sockets held
-    # in thread-local variables.
-    def local_socket_done(socket)
-      if self.connections[self.object_id][:reader] == socket
-        if self.read_pool.sockets_low? ||
-          self.read_pool != @sockets_to_pools[socket]
-          checkin(socket)
-          self.connections[self.object_id][:reader] = nil
-        end
-      end
-
-      if self.connections[self.object_id][:writer] == socket
-        if self.primary_pool &&
-          (self.primary_pool.sockets_low? ||
-           self.primary_pool != @sockets_to_pools[socket])
-          checkin(socket)
-          self.connections[self.object_id][:writer] = nil
-        end
-      end
-
-      if (Time.now - @last_cleanup) > CLEANUP_INTERVAL &&
-           @cleanup_lock.try_lock
-        @threads_to_sockets.each do |thread, sockets|
-          if !thread.alive?
-            checkin(sockets[:reader])
-            checkin(sockets[:writer])
-            @threads_to_sockets.delete(thread)
-          end
-        end
-
-        @cleanup_lock.unlock
-      end
-    end
-
     # Checkout a socket for reading (i.e., a secondary node).
     # Note that @read_pool might point to the primary pool
     # if no read pool has been defined.
     def checkout_reader
-      connect unless connected?
-      socket = get_socket_from_pool(self.read_pool)
-
-      if !socket
+      if connected?
+        sync_refresh
+      else
         connect
-        socket = get_socket_from_pool(self.primary_pool)
+      end
+
+      begin
+        socket = get_socket_from_pool(self.read_pool)
+
+        if !socket
+          connect
+          socket = get_socket_from_pool(self.primary_pool)
+        end
+      rescue => ex
+        checkin(socket) if socket
+        raise ex
       end
 
       if socket
@@ -394,12 +334,21 @@ module Mongo
 
     # Checkout a socket for writing (i.e., a primary node).
     def checkout_writer
-      connect unless connected?
-      socket = get_socket_from_pool(self.primary_pool)
-
-      if !socket
+      if connected?
+        sync_refresh
+      else
         connect
+      end
+      begin
         socket = get_socket_from_pool(self.primary_pool)
+
+        if !socket
+          connect
+          socket = get_socket_from_pool(self.primary_pool)
+        end
+      rescue => ex
+        checkin(socket)
+        raise ex
       end
 
       if socket
@@ -409,30 +358,26 @@ module Mongo
       end
     end
 
-    def checkin(socket)
-      if pool = @sockets_to_pools[socket]
-        pool.checkin(socket)
-        if !@sockets_to_pools[socket]
-          close_socket(socket)
-        end
-      elsif socket
+    # Checkin a socket used for reading.
+    def checkin_reader(socket)
+      if !((self.read_pool && self.read_pool.checkin(socket)) ||
+        (self.primary_pool && self.primary_pool.checkin(socket)))
         close_socket(socket)
       end
+      sync_refresh
+    end
 
-      @sockets_to_pools.delete(socket)
-
-      # Refresh synchronously every @refresh_interval seconds
-      # if synchronous refresh mode is enabled.
-      if @refresh_mode == :sync &&
-        ((Time.now - @last_refresh) > @refresh_interval)
-        refresh
-        @last_refresh = Time.now
+    # Checkin a socket used for writing.
+    def checkin_writer(socket)
+      if !self.primary_pool || !self.primary_pool.checkin(socket)
+        close_socket(socket)
       end
+      sync_refresh
     end
 
     def close_socket(socket)
       begin
-        socket.close
+        socket.close if socket
       rescue IOError
         log(:info, "Tried to close socket #{socket} but already closed.")
       end
@@ -442,7 +387,6 @@ module Mongo
       begin
         if pool
           socket = pool.checkout
-          @sockets_to_pools[socket] = pool
           socket
         end
       rescue ConnectionFailure => ex
@@ -456,36 +400,40 @@ module Mongo
     end
 
     def primary
-      @manager.primary
+      @manager ? @manager.primary : nil
     end
 
     # Note: might want to freeze these after connecting.
     def secondaries
-      @manager.secondaries
+      @manager ? @manager.secondaries : []
     end
 
     def hosts
-      @manager.hosts
+      @manager ? @manager.hosts : []
     end
 
     def primary_pool
-      @manager.primary_pool
+      @manager ? @manager.primary_pool : nil
     end
 
     def read_pool
-      @manager.read_pool
+      @manager ? @manager.read_pool : nil
     end
 
     def secondary_pools
-      @manager.secondary_pools
+      @manager ? @manager.secondary_pools : []
     end
 
     def tag_map
-      @manager.tag_map
+      @manager ? @manager.tag_map : {}
     end
 
     def max_bson_size
-      @manager.max_bson_size
+      if @manager && @manager.max_bson_size
+        @manager.max_bson_size
+      else
+        Mongo::DEFAULT_MAX_BSON_SIZE
+      end
     end
 
     private
@@ -521,7 +469,7 @@ module Mongo
       @pool_timeout = opts[:pool_timeout] || opts[:timeout] || 5.0
 
       # Timeout on socket read operation.
-      @op_timeout = opts[:op_timeout] || nil
+      @op_timeout = opts[:op_timeout] || 30
 
       # Timeout on socket connect.
       @connect_timeout = opts[:connect_timeout] || nil
@@ -543,39 +491,13 @@ module Mongo
       @cleanup_lock = Mutex.new
 
       if @logger
-        @logger.debug("MongoDB logging. Please note that logging negatively impacts performance " +
-        "and should be disabled for high-performance production apps.")
-      end
-
-      should_connect = opts.fetch(:connect, true)
-      connect if should_connect
-    end
-
-    # Given a pool manager, update this connection's
-    # view of the replica set.
-    def update_config(new_manager)
-      old_manager = @manager
-      @manager = new_manager
-      @seeds   = @manager.seeds.dup
-      @sockets_to_pools.clear
-      @refresh_version += 1
-    end
-
-    # If we're using async refresh, start
-    # a background thread to run the refresh method
-    # every @refresh_interval seconds.
-    def initiate_refresh_mode
-      if @refresh_mode == :async
-        return if @refresh_thread && @refresh_thread.alive?
-        @refresh_thread = Thread.new do
-          while true && @connected do
-            sleep(@refresh_interval)
-            refresh
-          end
-        end
+        write_logging_startup_message
       end
 
       @last_refresh = Time.now
+
+      should_connect = opts.fetch(:connect, true)
+      connect if should_connect
     end
 
     # Checkout a socket connected to a node with one of
@@ -588,7 +510,6 @@ module Mongo
         pool = self.tag_map[{k.to_s => v}]
         if pool
           socket = pool.checkout
-          @sockets_to_pools[socket] = pool
           return socket
         end
       end
@@ -597,18 +518,12 @@ module Mongo
         "Could not find a connection tagged with #{tags}."
     end
 
-    # Checkin a socket used for reading.
-    def checkin_reader(socket)
-      warn "ReplSetConnection#checkin_writer is deprecated and will be removed " +
-        "in driver v2.0. Use ReplSetConnection#checkin instead."
-      checkin(socket)
-    end
-
-    # Checkin a socket used for writing.
-    def checkin_writer(socket)
-      warn "ReplSetConnection#checkin_writer is deprecated and will be removed " +
-        "in driver v2.0. Use ReplSetConnection#checkin instead."
-      checkin(socket)
+    def sync_refresh
+      if @refresh_mode == :sync &&
+        ((Time.now - @last_refresh) > @refresh_interval)
+        @last_refresh = Time.now
+        refresh
+      end
     end
   end
 end
