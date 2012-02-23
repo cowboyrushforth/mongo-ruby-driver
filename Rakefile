@@ -12,6 +12,7 @@ begin
   rescue LoadError
 end
 include Config
+
 ENV['TEST_MODE'] = 'TRUE'
 
 task :java do
@@ -42,10 +43,14 @@ task :test do
   puts "To test the pure ruby driver: \nrake test:ruby\n\n"
 end
 
+task :path do
+    $:.unshift(File.join(File.dirname(__FILE__), 'lib'))
+end
+
 namespace :test do
 
   desc "Test the driver with the C extension enabled."
-  task :c do
+  task :c => :path do
     ENV['C_EXT'] = 'TRUE'
     if ENV['TEST']
       Rake::Task['test:functional'].invoke
@@ -60,7 +65,7 @@ namespace :test do
   end
 
   desc "Test the driver using pure ruby (no C extension)"
-  task :ruby do
+  task :ruby => :path do
     ENV['C_EXT'] = nil
     if ENV['TEST']
       Rake::Task['test:functional'].invoke
@@ -76,6 +81,13 @@ namespace :test do
   desc "Run the replica set test suite"
   Rake::TestTask.new(:rs) do |t|
     t.test_files = FileList['test/replica_sets/*_test.rb']
+    t.verbose    = true
+    t.ruby_opts << '-w'
+  end
+
+  desc "Run the replica set test suite"
+  Rake::TestTask.new(:rs_no_threads) do |t|
+    t.test_files = FileList['test/replica_sets/*_test.rb'] - ["test/replica_sets/refresh_with_threads_test.rb"]
     t.verbose    = true
     t.ruby_opts << '-w'
   end
@@ -122,9 +134,9 @@ namespace :test do
     t.ruby_opts << '-w'
   end
 
-  task :drop_databases do |t|
+  task :drop_databases => :path do |t|
     puts "Dropping test databases..."
-    require './lib/mongo'
+    require 'mongo'
     con = Mongo::Connection.new(ENV['MONGO_RUBY_DRIVER_HOST'] || 'localhost',
       ENV['MONGO_RUBY_DRIVER_PORT'] || Mongo::Connection::DEFAULT_PORT)
     con.database_names.each do |name|
@@ -143,14 +155,13 @@ end
 
 desc "Generate YARD documentation"
 task :ydoc do
-  $:.unshift(File.join(File.dirname(__FILE__), 'lib'))
-  require File.join(File.dirname(__FILE__), 'lib', 'mongo')
+  require 'mongo'
   out = File.join('ydoc', Mongo::VERSION)
   FileUtils.rm_rf('ydoc')
   system "yardoc lib/**/*.rb lib/mongo/**/*.rb lib/bson/**/*.rb -e ./yard/yard_ext.rb -p yard/templates -o #{out} --title MongoRuby-#{Mongo::VERSION} --files docs/TUTORIAL.md,docs/GridFS.md,docs/FAQ.md,docs/REPLICA_SETS.md,docs/WRITE_CONCERN.md,docs/READ_PREFERENCE.md,docs/HISTORY.md,docs/CREDITS.md,docs/RELEASES.md,docs/CREDITS.md,docs/TAILABLE_CURSORS.md"
 end
 
-namespace :bamboo do
+namespace :jenkins do
   task :ci_reporter do
     begin
       require 'ci/reporter/rake/test_unit'
@@ -184,10 +195,14 @@ namespace :gem do
     `rm mongo-*.gem`
     `rm bson-*.gem`
   end
+  
+  desc "Uninstall the optional c extensions"
+  task :uninstall_extensions do
+    `gem uninstall bson_ext`
+  end
 
   desc "Install the optional c extensions"
   task :install_extensions do
-    `gem uninstall bson_ext`
     `gem build bson_ext.gemspec`
     `gem install --no-rdoc --no-ri bson_ext-*.gem`
     `rm bson_ext-*.gem`
@@ -205,7 +220,7 @@ end
 
 namespace :ci do
   namespace :test do
-    task :c do
+    task :c => :path do
       Rake::Task['gem:install'].invoke
       Rake::Task['gem:install_extensions'].invoke
       Rake::Task['test:c'].invoke

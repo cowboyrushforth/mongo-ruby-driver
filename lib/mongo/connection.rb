@@ -38,7 +38,7 @@ module Mongo
 
     attr_reader :logger, :size, :auths, :primary, :safe, :host_to_try,
       :pool_size, :connect_timeout, :pool_timeout,
-      :primary_pool, :socket_class
+      :primary_pool, :socket_class, :op_timeout
 
     # Create a connection to single MongoDB instance.
     #
@@ -52,7 +52,7 @@ module Mongo
     # Connection#arbiters. This is useful if your application needs to connect manually to nodes other
     # than the primary.
     #
-    # @param [String, Hash] host.
+    # @param [String, Hash] host
     # @param [Integer] port specify a port number here if only one host is being specified.
     #
     # @option opts [Boolean, Hash] :safe (false) Set the default safe-mode options
@@ -348,7 +348,7 @@ module Mongo
       self["admin"].command(oh)
     end
 
-    # Checks if a server is alive. This command will return immediately 
+    # Checks if a server is alive. This command will return immediately
     # even if the server is in a lock.
     #
     # @return [Hash]
@@ -379,14 +379,6 @@ module Mongo
       @slave_ok
     end
 
-    def get_socket_from_thread_local
-      Thread.current[:socket_map] ||= {}
-      Thread.current[:socket_map][self] ||= {}
-      Thread.current[:socket_map][self][:writer] ||= checkout_writer
-      Thread.current[:socket_map][self][:reader] = 
-        Thread.current[:socket_map][self][:writer]
-    end
-
     # Create a new socket and attempt to connect to master.
     # If successful, sets host and port to master and returns the socket.
     #
@@ -414,10 +406,6 @@ module Mongo
       end
     end
     alias :reconnect :connect
-
-    def connecting?
-      @nodes_to_try.length > 0
-    end
 
     # It's possible that we defined connected as all nodes being connected???
     # NOTE: Do check if this needs to be more stringent.
@@ -550,21 +538,14 @@ module Mongo
       # Timeout on socket connect.
       @connect_timeout = opts[:connect_timeout] || nil
 
-      # Mutex for synchronizing pool access
-      # TODO: remove this.
-      @connection_mutex = Mutex.new
-
       # Global safe option. This is false by default.
       @safe = opts[:safe] || false
-
-      # Condition variable for signal and wait
-      @queue = ConditionVariable.new
-
+      
       # Connection pool for primay node
       @primary      = nil
       @primary_pool = nil
 
-      @logger = opts[:logger] || nil
+      @logger = opts.fetch(:logger, nil)
 
       if @logger
         write_logging_startup_message

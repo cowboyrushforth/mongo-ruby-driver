@@ -37,7 +37,7 @@ for much more:
 
 ### Ruby Versions
 
-The driver works and is consistently tested on Ruby 1.8.6, 1.8.7, and 1.9.2, and JRuby 1.5.1.
+The driver works and is consistently tested on Ruby 1.8.7 and 1.9.3 as well as JRuby 1.6.6.
 
 Note that if you're on 1.8.7, be sure that you're using a patchlevel >= 249. There
 are some IO bugs in earlier versions.
@@ -198,7 +198,7 @@ Here is a sample primary key factory, taken from the tests:
 
     class TestPKFactory
       def create_pk(row)
-        row['_id'] ||= Mongo::ObjectID.new
+        row['_id'] ||= BSON::ObjectId.new
         row
       end
     end
@@ -212,7 +212,7 @@ ActiveRecord-like framework for non-Rails apps) and the AR Mongo adapter code
       def create_pk(row)
         return row if row[:_id]
         row.delete(:_id)      # in case it exists but the value is nil
-        row['_id'] ||= Mongo::ObjectID.new
+        row['_id'] ||= BSON::ObjectId.new
         row
       end
     end
@@ -283,12 +283,9 @@ To run any individual rake tasks with the C extension enabled, just pass C_EXT=t
 
     $ rake test:unit C_EXT=true
 
-If you want to test replica set, you can run the following tests
-individually:
+If you want to test replica set, you can run the following task:
 
-    $ rake test:replica_set_count
-    $ rake test:replica_set_insert
-    $ rake test:replica_set_query
+    $ rake test:rs
 
 ### Shoulda and Mocha
 

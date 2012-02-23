@@ -20,7 +20,6 @@ module Mongo
 
   # Instantiates and manages connections to a MongoDB replica set.
   class ReplSetConnection < Connection
-    CLEANUP_INTERVAL = 300
 
     attr_reader :replica_set_name, :seeds, :refresh_interval, :refresh_mode,
       :refresh_version
@@ -32,26 +31,25 @@ module Mongo
     # Connection#arbiters. This is useful if your application needs to connect manually to nodes other
     # than the primary.
     #
-    # @param [Array] args A list of host-port pairs to be used as seed nodes followed by a
-    #   hash containing any options. See the examples below for exactly how to use the constructor.
+    # @param [Array] seeds "host:port" strings
     #
-    # @option options [String] :rs_name (nil) The name of the replica set to connect to. You
+    # @option opts [String] :rs_name (nil) The name of the replica set to connect to. You
     #   can use this option to verify that you're connecting to the right replica set.
-    # @option options [Boolean, Hash] :safe (false) Set the default safe-mode options
+    # @option opts [Boolean, Hash] :safe (false) Set the default safe-mode options
     #   propogated to DB objects instantiated off of this Connection. This
     #   default can be overridden upon instantiation of any DB by explicity setting a :safe value
     #   on initialization.
-    # @option options [:primary, :secondary] :read (:primary) The default read preference for Mongo::DB
+    # @option opts [:primary, :secondary] :read (:primary) The default read preference for Mongo::DB
     #   objects created from this connection object. If +:secondary+ is chosen, reads will be sent
     #   to one of the closest available secondary nodes. If a secondary node cannot be located, the
     #   read will be sent to the primary.
-    # @option options [Logger] :logger (nil) Logger instance to receive driver operation log.
-    # @option options [Integer] :pool_size (1) The maximum number of socket connections allowed per
+    # @option opts [Logger] :logger (nil) Logger instance to receive driver operation log.
+    # @option opts [Integer] :pool_size (1) The maximum number of socket connections allowed per
     #   connection pool. Note: this setting is relevant only for multi-threaded applications.
-    # @option options [Float] :pool_timeout (5.0) When all of the connections a pool are checked out,
+    # @option opts [Float] :pool_timeout (5.0) When all of the connections a pool are checked out,
     #   this is the number of seconds to wait for a new connection to be released before throwing an exception.
     #   Note: this setting is relevant only for multi-threaded applications.
-    # @option opts [Float] :op_timeout (30) The number of seconds to wait for a read operation to time out.
+    # @option opts [Float] :op_timeout (nil) The number of seconds to wait for a read operation to time out.
     # @option opts [Float] :connect_timeout (30) The number of seconds to wait before timing out a
     #   connection attempt.
     # @option opts [Boolean] :ssl (false) If true, create the connection to the server using SSL.
@@ -63,17 +61,17 @@ module Mongo
     #   between calls to check the replica set's state.
     # @option opts [Boolean] :require_primary (true) If true, require a primary node for the connection
     #   to succeed. Otherwise, connection will succeed as long as there's at least one secondary node.
+    # Note: that the number of seed nodes does not have to be equal to the number of replica set members.
+    # The purpose of seed nodes is to permit the driver to find at least one replica set member even if a member is down.
     #
-    # @example Connect to a replica set and provide two seed nodes. Note that the number of seed nodes does
-    #   not have to be equal to the number of replica set members. The purpose of seed nodes is to permit
-    #   the driver to find at least one replica set member even if a member is down.
-    #   ReplSetConnection.new(['localhost', 30000], ['localhost', 30001])
+    # @example Connect to a replica set and provide two seed nodes.
+    #   ReplSetConnection.new(['localhost:30000', 'localhost:30001'])
     #
     # @example Connect to a replica set providing two seed nodes and ensuring a connection to the replica set named 'prod':
-    #   ReplSetConnection.new(['localhost', 30000], ['localhost', 30001], :rs_name => 'prod')
+    #   ReplSetConnection.new(['localhost:30000', 'localhost:30001'], :name => 'prod')
     #
     # @example Connect to a replica set providing two seed nodes and allowing reads from a secondary node:
-    #   ReplSetConnection.new(['localhost', 30000], ['localhost', 30001], :read_secondary => true)
+    #   ReplSetConnection.new(['localhost:30000', 'localhost:30001'], :read => :secondary)
     #
     # @see http://api.mongodb.org/ruby/current/file.REPLICA_SETS.html Replica sets in Ruby
     #
@@ -85,23 +83,33 @@ module Mongo
       else
         opts = {}
       end
-
+      
       unless args.length > 0
         raise MongoArgumentError, "A ReplSetConnection requires at least one seed node."
       end
+      
+      # This is temporary until support for the old format is dropped
+      @seeds = []
+      if args.first.last.is_a?(Integer)
+        warn "Initiating a ReplSetConnection with seeds passed as individual [host, port] array arguments is deprecated."
+        warn "Please specify hosts as an array of 'host:port' strings; the old format will be removed in v2.0"
+        @seeds = args
+      else
+        args.first.map do |host_port|
+          seed = host_port.split(":")
+          seed[1] = seed[1].to_i
+          seeds << seed
+        end
+      end
 
-      # The original, immutable list of seed node.
       # TODO: add a method for replacing this list of node.
-      @seeds = args
       @seeds.freeze
-
-      # TODO: get rid of this
-      @nodes = @seeds.dup
 
       # Refresh
       @refresh_mode = opts.fetch(:refresh_mode, false)
       @refresh_interval = opts[:refresh_interval] || 90
       @last_refresh = Time.now
+      @refresh_version = 0
 
       # No connection manager by default.
       @manager = nil
@@ -127,7 +135,6 @@ module Mongo
       end
 
       @connected = false
-      @refresh_version = 0
 
       # Replica set name
       if opts[:rs_name]
@@ -212,7 +219,6 @@ module Mongo
       @manager = background_manager
       old_manager.close(:soft => true)
       @refresh_version += 1
-
       return true
     end
 
@@ -312,10 +318,8 @@ module Mongo
       else
         connect
       end
-
       begin
         socket = get_socket_from_pool(self.read_pool)
-
         if !socket
           connect
           socket = get_socket_from_pool(self.primary_pool)
@@ -329,6 +333,26 @@ module Mongo
         socket
       else
         raise ConnectionFailure.new("Could not connect to a node for reading.")
+      end
+    end
+    
+    def checkout_secondary
+      if connected?
+        sync_refresh
+      else
+        connect
+      end
+      begin
+        socket = get_socket_from_pool(self.secondary_pool)
+      rescue => ex
+        checkin(socket) if socket
+        raise ex
+      end
+
+      if socket
+        socket
+      else
+        raise ConnectionFailure.new("Could not connect to a secondary for reading.")
       end
     end
 
@@ -419,6 +443,10 @@ module Mongo
     def read_pool
       @manager ? @manager.read_pool : nil
     end
+    
+    def secondary_pool
+      @manager ? @manager.secondary_pool : nil
+    end
 
     def secondary_pools
       @manager ? @manager.secondary_pools : []
@@ -440,64 +468,12 @@ module Mongo
 
     # Generic initialization code.
     def setup(opts)
-      # Default maximum BSON object size
-      @max_bson_size = Mongo::DEFAULT_MAX_BSON_SIZE
-
       @safe_mutex_lock = Mutex.new
       @safe_mutexes = Hash.new {|hash, key| hash[key] = Mutex.new}
-
-      # Determine whether to use SSL.
-      @ssl = opts.fetch(:ssl, false)
-      if @ssl
-        @socket_class = Mongo::SSLSocket
-      else
-        @socket_class = ::TCPSocket
-      end
-
-      # Authentication objects
-      @auths = opts.fetch(:auths, [])
-
-      # Lock for request ids.
-      @id_lock = Mutex.new
-
-      # Pool size and timeout.
-      @pool_size = opts[:pool_size] || 1
-      if opts[:timeout]
-        warn "The :timeout option has been deprecated " +
-          "and will be removed in the 2.0 release. Use :pool_timeout instead."
-      end
-      @pool_timeout = opts[:pool_timeout] || opts[:timeout] || 5.0
-
-      # Timeout on socket read operation.
-      @op_timeout = opts[:op_timeout] || 30
-
-      # Timeout on socket connect.
-      @connect_timeout = opts[:connect_timeout] || 30
-
-      # Mutex for synchronizing pool access
-      # TODO: remove this.
-      @connection_mutex = Mutex.new
-
-      # Global safe option. This is false by default.
-      @safe = opts[:safe] || false
-
-      # Condition variable for signal and wait
-      @queue = ConditionVariable.new
-
-      @logger = opts[:logger] || nil
-
-      # Clean up connections to dead threads.
-      @last_cleanup = Time.now
-      @cleanup_lock = Mutex.new
-
-      if @logger
-        write_logging_startup_message
-      end
-
-      @last_refresh = Time.now
-
-      should_connect = opts.fetch(:connect, true)
-      connect if should_connect
+      
+      opts[:connect_timeout] = opts[:connect_timeout] || 30
+      
+      super opts
     end
 
     # Checkout a socket connected to a node with one of
